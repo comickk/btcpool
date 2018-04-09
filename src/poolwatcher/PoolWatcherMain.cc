@@ -38,12 +38,15 @@
 #include "Utils.h"
 #include "Watcher.h"
 
+//
+
 using namespace std;
 using namespace libconfig;
 
 // container for pool watch clients
 ClientContainer *gClientContainer = nullptr;
 
+//信号处理函数
 void handler(int sig) {
   if (gClientContainer) {
     gClientContainer->stop();
@@ -77,6 +80,7 @@ int main(int argc, char **argv) {
     }
   }
 
+  //日志
   // Initialize Google's logging library.
   google::InitGoogleLogging(argv[0]);
   FLAGS_log_dir         = string(optLogDir);
@@ -88,6 +92,8 @@ int main(int argc, char **argv) {
   FLAGS_stop_logging_if_full_disk = true;
 
   // Read the file. If there is an error, report it and exit.
+
+  //读取配置文件
   Config cfg;
   try
   {
@@ -109,6 +115,7 @@ int main(int argc, char **argv) {
     return(EXIT_FAILURE);
   }
 
+  //添加信号处理
   signal(SIGTERM, handler);
   signal(SIGINT,  handler);
 
@@ -122,10 +129,14 @@ int main(int argc, char **argv) {
     SelectParams(CBaseChainParams::MAIN);
   }
 
+  //创建对像，参数从配置文件中取得 代理服务器地址
   gClientContainer = new ClientContainer(cfg.lookup("kafka.brokers"));
 
   // add pools
   {
+
+	  cout << "--------add pools---------" << endl;
+	 //取配置
     const Setting &root = cfg.getRoot();
     const Setting &pools = root["pools"];
 
@@ -137,6 +148,7 @@ int main(int argc, char **argv) {
       pools[i].lookupValue("port", port);
       pools[i].lookupValue("worker", worker);
 
+	  //根据配置添加矿池
       gClientContainer->addPools(name, host, (int16_t)port, worker);
     }
   }

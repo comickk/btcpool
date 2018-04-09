@@ -39,10 +39,19 @@
 static
 bool tryReadLine(string &line, struct bufferevent *bufev) {
   line.clear();
+  //从输入缓冲区取 数据
   struct evbuffer *inBuf = bufferevent_get_input(bufev);
 
-  // find eol
+  // find eol  
+  //eol = end of line
   struct evbuffer_ptr loc;
+  //检测行结束，不复制行，返回指向行结束符的evbuffer_ptr
+  /*
+		struct evbuffer_ptr evbuffer_search_eol( struct evbuffer *buffer, //搜索数据
+																	 struct evbuffer_ptr *star,size_t *eol_len_out, //搜索区域
+																	 enum evbuffer_eol_style eol_style);//搜索标志
+  */
+  //EVBUFFER_EOL_LF  行尾是单个换行符（也就是\n，ASCII值是0x0A）
   loc = evbuffer_search_eol(inBuf, NULL, NULL, EVBUFFER_EOL_LF);
   if (loc.pos == -1) {
     return false;  // not found
@@ -51,6 +60,9 @@ bool tryReadLine(string &line, struct bufferevent *bufev) {
   // copies and removes the first datlen bytes from the front of buf
   // into the memory at data
   line.resize(loc.pos + 1);  // containing "\n"
+
+  cout << "------tryReadLine------\n" << line << endl;
+
   evbuffer_remove(inBuf, (void *)line.data(), line.size());
 
   return true;
@@ -130,12 +142,16 @@ kafkaProducer_(kafkaBrokers_.c_str(), KAFKA_TOPIC_RAWGBT, 0/* partition */),
 kafkaStratumJobConsumer_(kafkaBrokers_.c_str(), KAFKA_TOPIC_STRATUM_JOB, 0/*patition*/),
 poolStratumJob_(nullptr)
 {
-  base_ = event_base_new();
-  assert(base_ != nullptr);
+	//创建新事件
+	base_ = event_base_new();
+	//assert宏的原型定义在<assert.h>中，其作用是如果它的条件返回错误，则终止程序执行
+	assert(base_ != nullptr);
 }
 
-ClientContainer::~ClientContainer() {
-  event_base_free(base_);
+//析构 
+//释放 事件
+ClientContainer::~ClientContainer() {	
+	event_base_free(base_);
 }
 
 boost::shared_lock<boost::shared_mutex> ClientContainer::getPoolStratumJobReadLock() {
@@ -197,11 +213,15 @@ void ClientContainer::consumeStratumJob(rd_kafka_message_t *rkmessage) {
     StratumJob *sjob = new StratumJob();
     bool res = sjob->unserializeFromJson((const char *)rkmessage->payload,
                                          rkmessage->len);
+
+	//未序列化的job
     if (res == false) {
       LOG(ERROR) << "unserialize stratum job fail";
       delete sjob;
       return;
     }
+
+	//超时的job
     // make sure the job is not expired.
     if (jobId2Time(sjob->jobId_) + 60 < time(nullptr)) {
       LOG(ERROR) << "too large delay from kafka to receive topic 'StratumJob'";
@@ -235,10 +255,12 @@ void ClientContainer::consumeStratumJob(rd_kafka_message_t *rkmessage) {
     }
 }
 
+//启动运行，开启执行循环
 void ClientContainer::run() {
   event_base_dispatch(base_);
 }
 
+//停止，退出事件循环
 void ClientContainer::stop() {
   if (!running_)
     return;
@@ -248,8 +270,10 @@ void ClientContainer::stop() {
   event_base_loopexit(base_, NULL);
 }
 
+//初始化 检查是否添加第三方矿池  、设置kafka
 bool ClientContainer::init() {
   // check pools
+	//检查添加的矿池
   if (clients_.size() == 0) {
     LOG(ERROR) << "no avaiable pools";
     return false;
@@ -295,13 +319,17 @@ bool ClientContainer::init() {
 }
 
 // do add pools before init()
+//添加矿池
 bool ClientContainer::addPools(const string &poolName, const string &poolHost,
                                const int16_t poolPort, const string &workerName) {
+  //创建指针，新建 对象
   auto ptr = new PoolWatchClient(base_, this,
                                  poolName, poolHost, poolPort, workerName);
+  //开启联接
   if (!ptr->connect()) {
     return false;
   }
+  //加入对象指针
   clients_.push_back(ptr);
 
   return true;
@@ -338,6 +366,9 @@ bool ClientContainer::makeEmptyGBT(int32_t blockHeight, uint32_t nBits,
                                 EncodeBase64(gbt).c_str(),
                                 gbtHash.ToString().c_str());
 
+
+  cout << "-------makeEmptyGBT----\n"<<gbt<<endl;
+
   // submit to Kafka
   kafkaProducer_.produce(sjob.c_str(), sjob.length());
 
@@ -348,6 +379,7 @@ bool ClientContainer::makeEmptyGBT(int32_t blockHeight, uint32_t nBits,
 }
 
 void ClientContainer::removeAndCreateClient(PoolWatchClient *client) {
+	
   for (size_t i = 0; i < clients_.size(); i++) {
     if (clients_[i] == client) {
       auto ptr = new PoolWatchClient(base_, this,
@@ -382,6 +414,8 @@ void ClientContainer::eventCallback(struct bufferevent *bev,
     // do subscribe
     string s = Strings::Format("{\"id\":1,\"method\":\"mining.subscribe\""
                                ",\"params\":[\"%s\"]}\n", BTCCOM_WATCHER_AGENT);
+
+	cout <<"------eventCallback-------\n"<<s<< endl;
     client->sendData(s);
     return;
   }
@@ -401,7 +435,9 @@ void ClientContainer::eventCallback(struct bufferevent *bev,
   }
 
   // update client
+  //重新连接poolwatcher
   container->removeAndCreateClient(client);
+  //cout<< x<< endl;
 }
 
 
@@ -416,9 +452,10 @@ poolPort_(poolPort), workerName_(workerName)
   bev_ = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
   assert(bev_ != nullptr);
 
+  //设置 事件回调
   bufferevent_setcb(bev_,
                     ClientContainer::readCallback,  NULL,
-                    ClientContainer::eventCallback, this);
+                    ClientContainer::eventCallback, this); //eventCallback 错误处理回调
   bufferevent_enable(bev_, EV_READ|EV_WRITE);
 
   extraNonce1_ = 0;
@@ -427,6 +464,7 @@ poolPort_(poolPort), workerName_(workerName)
   state_ = INIT;
 
   // set read timeout
+  //当前秒数 {秒数，微秒数}
   struct timeval readtv = {120, 0};
   bufferevent_set_timeouts(bev_, &readtv, NULL);
 }
@@ -435,9 +473,12 @@ PoolWatchClient::~PoolWatchClient() {
   bufferevent_free(bev_);
 }
 
+//连接
 bool PoolWatchClient::connect() {
   struct sockaddr_in sin;
+  //内存操作，全置0
   memset(&sin, 0, sizeof(sin));
+
   sin.sin_family = AF_INET;
   sin.sin_port   = htons(poolPort_);
   if (!resolve(poolHost_, &sin.sin_addr)) {
@@ -455,6 +496,7 @@ bool PoolWatchClient::connect() {
   return false;
 }
 
+//发送数据
 void PoolWatchClient::sendData(const char *data, size_t len) {
   // add data to a bufferevent’s output buffer
   bufferevent_write(bev_, data, len);
@@ -478,6 +520,8 @@ bool PoolWatchClient::handleMessage() {
 
 void PoolWatchClient::handleStratumMessage(const string &line) {
   DLOG(INFO) << "<" << poolName_ << "> UpPoolWatchClient recv(" << line.size() << "): " << line;
+
+  cout<<"---------handleStratumMessage----------\n"<<line<<endl;
 
   JsonNode jnode;
   if (!JsonNode::parse(line.data(), line.data() + line.size(), jnode)) {
@@ -533,7 +577,12 @@ void PoolWatchClient::handleStratumMessage(const string &line) {
           // it will unlock by itself in destructor.
           auto readLock = container_->getPoolStratumJobReadLock();
           const StratumJob *poolStratumJob = container_->getPoolStratumJob();
-
+		  /*
+		  丢弃从第三方矿池接收的job：
+		  job高度与本地矿池job高度相同
+		  job高度不等于本地矿池job高度+1，高度跳跃太大
+		  nBits与本地矿池job nBits不同
+		  */
           if (poolStratumJob == nullptr) {
             LOG(WARNING) << "<" << poolName_ << "> discard the job: pool stratum job is empty";
             return;
@@ -569,6 +618,7 @@ void PoolWatchClient::handleStratumMessage(const string &line) {
           nVersion = poolStratumJob->nVersion_;
         }
 
+		//作为client连接第三方矿池，如收到挖矿任务，仅当接收的job高度=本地矿池job高度+1时，将构造EmptyGBT
         container_->makeEmptyGBT(blockHeight, nBits, prevHash, blockTime, nVersion);
 
       }
