@@ -41,9 +41,15 @@
 #ifndef WORK_WITH_STRATUM_SWITCHER
 
 //////////////////////////////// SessionIDManager //////////////////////////////
+//使用sessionID作为extraNonce1_以确保矿机任务不重复
 SessionIDManager::SessionIDManager(const uint8_t serverId) :
 serverId_(serverId), count_(0), allocIdx_(0)
 {
+	//  std::bitset<MAX_SESSION_INDEX_SERVER + 1> sessionIds_;
+	//#define MAX_SESSION_INDEX_SERVER   0x00FFFFFEu   // 16777214
+	//sessionIds_ 为一串2进制数，默认全为0，
+	//sessionIds_ 有 16777214位，用16 进制表示  0x00  FFFFFE  u
+
   sessionIds_.reset();
 }
 
@@ -53,12 +59,14 @@ bool SessionIDManager::ifFull() {
 }
 
 bool SessionIDManager::_ifFull() {
+	//检测 sessionIds_ 是否已满 (全为1)
   if (count_ >= (int32_t)(MAX_SESSION_INDEX_SERVER + 1)) {
     return true;
   }
   return false;
 }
 
+//分配SessionID
 bool SessionIDManager::allocSessionId(uint32_t *sessionID) {
   ScopeLock sl(lock_);
 
@@ -66,6 +74,8 @@ bool SessionIDManager::allocSessionId(uint32_t *sessionID) {
     return false;
 
   // find an empty bit
+ 
+  //检测 第 allocIdx_ 位是否为 1
   while (sessionIds_.test(allocIdx_) == true) {
     allocIdx_++;
     if (allocIdx_ > MAX_SESSION_INDEX_SERVER) {
@@ -74,6 +84,7 @@ bool SessionIDManager::allocSessionId(uint32_t *sessionID) {
   }
 
   // set to true
+  //设置 第 allocIdx_ 位 为 1
   sessionIds_.set(allocIdx_, true);
   count_++;
 
@@ -81,6 +92,7 @@ bool SessionIDManager::allocSessionId(uint32_t *sessionID) {
   return true;
 }
 
+//释放一个位,   即   设置  第sessionId 位的 为 0 
 void SessionIDManager::freeSessionId(uint32_t sessionId) {
   ScopeLock sl(lock_);
 
@@ -93,16 +105,19 @@ void SessionIDManager::freeSessionId(uint32_t sessionId) {
 
 
 ////////////////////////////////// JobRepository ///////////////////////////////
+//工作仓库
 JobRepository::JobRepository(const char *kafkaBrokers,
                              const string &fileLastNotifyTime,
                              Server *server):
+// atomic<bool> running_; 原子布尔,用于多线程环境 数据结构的无锁设计
 running_(true),
+//用于接收消息的kafka
 kafkaConsumer_(kafkaBrokers, KAFKA_TOPIC_STRATUM_JOB, 0/*patition*/),
 server_(server), fileLastNotifyTime_(fileLastNotifyTime),
 kMaxJobsLifeTime_(300),
 kMiningNotifyInterval_(30),  // TODO: make as config arg
 lastJobSendTime_(0)
-{
+{	
   assert(kMiningNotifyInterval_ < kMaxJobsLifeTime_);
 }
 
@@ -115,7 +130,7 @@ shared_ptr<StratumJobEx> JobRepository::getStratumJobEx(const uint64_t jobId) {
   ScopeLock sl(lock_);
   auto itr = exJobs_.find(jobId);
   if (itr != exJobs_.end()) {
-    return itr->second;
+    return itr->second;//itr->first  (key)  ,  itr->value (value)
   }
   return nullptr;
 }
@@ -123,7 +138,7 @@ shared_ptr<StratumJobEx> JobRepository::getStratumJobEx(const uint64_t jobId) {
 shared_ptr<StratumJobEx> JobRepository::getLatestStratumJobEx() {
   ScopeLock sl(lock_);
   if (exJobs_.size()) {
-    return exJobs_.rbegin()->second;
+    return exJobs_.rbegin()->second;//rbegin()反向迭代,指向最后一元素
   }
   LOG(WARNING) << "getLatestStratumJobEx fail";
   return nullptr;
@@ -173,6 +188,7 @@ void JobRepository::runThreadConsume() {
     }
 
     // consume stratum job
+	//消费 消息
     consumeStratumJob(rkmessage);
     rd_kafka_message_destroy(rkmessage);  /* Return message to rdkafka */
 
@@ -207,7 +223,7 @@ void JobRepository::consumeStratumJob(rd_kafka_message_t *rkmessage) {
     }
     return;
   }
-
+  //没有错误时从 rkmessage->payload中 反序列化 取得数据
   StratumJob *sjob = new StratumJob();
   bool res = sjob->unserializeFromJson((const char *)rkmessage->payload,
                                        rkmessage->len);
@@ -216,20 +232,24 @@ void JobRepository::consumeStratumJob(rd_kafka_message_t *rkmessage) {
     delete sjob;
     return;
   }
-  // make sure the job is not expired.
+  // make sure the job is not expired.   
+  //超时
   if (jobId2Time(sjob->jobId_) + 60 < time(nullptr)) {
     LOG(ERROR) << "too large delay from kafka to receive topic 'StratumJob'";
     delete sjob;
     return;
   }
   // here you could use Map.find() without lock, it's sure
-  // that everyone is using this Map readonly now
+  // that everyone is using this Map readonly now   
+  //已存在
   if (exJobs_.find(sjob->jobId_) != exJobs_.end()) {
     LOG(ERROR) << "jobId already existed";
     delete sjob;
     return;
   }
 
+  //如果job中prevHash与本地job中prevHash不同，即为已产生新块，job中isClean状态将置为true
+  //true即要求矿机立即切换job
   bool isClean = false;
   if (latestPrevBlockHash_ != sjob->prevHash_) {
     isClean = true;
@@ -257,6 +277,7 @@ void JobRepository::consumeStratumJob(rd_kafka_message_t *rkmessage) {
 
     if (isClean) {
       // mark all jobs as stale, should do this before insert new job
+	 //遍历exJobs_ , 设置 state 为1，即为 已过时的
       for (auto it : exJobs_) {
         it.second->markStale();
       }
@@ -297,14 +318,16 @@ void JobRepository::markAllJobsAsStale() {
 
 void JobRepository::checkAndSendMiningNotify() {
   // last job is 'expried', send a new one
+	//检测 job是否过期
   if (exJobs_.size() &&
+	  // 上个job的发送时间 + 发送间隔 <= 当前时间
       lastJobSendTime_ + kMiningNotifyInterval_ <= time(nullptr))
   {
     shared_ptr<StratumJobEx> exJob = exJobs_.rbegin()->second;
     sendMiningNotify(exJob);
   }
 }
-
+//发送挖矿通知
 void JobRepository::sendMiningNotify(shared_ptr<StratumJobEx> exJob) {
   static uint64_t lastJobId = 0;
   if (lastJobId == exJob->sjob_->jobId_) {
@@ -314,6 +337,7 @@ void JobRepository::sendMiningNotify(shared_ptr<StratumJobEx> exJob) {
 
   // send job to all clients
   server_->sendMiningNotifyToAll(exJob);
+  //记录最后一次发送job的时间 和 ID
   lastJobSendTime_ = time(nullptr);
   lastJobId = exJob->sjob_->jobId_;
 
@@ -322,8 +346,9 @@ void JobRepository::sendMiningNotify(shared_ptr<StratumJobEx> exJob) {
     writeTime2File(fileLastNotifyTime_.c_str(), (uint32_t)lastJobSendTime_);
 }
 
+//清除过期job
 void JobRepository::tryCleanExpiredJobs() {
-  ScopeLock sl(lock_);
+  ScopeLock sl(lock_); 
 
   const uint32_t nowTs = (uint32_t)time(nullptr);
   while (exJobs_.size()) {
@@ -476,11 +501,13 @@ int32_t UserInfo::incrementalUpdateUsers() {
   //
   const string url = Strings::Format("%s?last_id=%d", apiUrl_.c_str(), lastMaxUserId_);
   string resp;
+  //取得用户列表 string
   if (!httpGET(url.c_str(), resp, 10000/* timeout ms */)) {
     LOG(ERROR) << "http get request user list fail, url: " << url;
     return -1;
   }
 
+  //将用户列表 string 转成 JsonNode
   JsonNode r;
   if (!JsonNode::parse(resp.c_str(), resp.c_str() + resp.length(), r)) {
     LOG(ERROR) << "decode json fail, json: " << resp;
@@ -496,12 +523,14 @@ int32_t UserInfo::incrementalUpdateUsers() {
   }
 
   pthread_rwlock_wrlock(&rwlock_);
+  //遍历取得的 用户
   for (const auto &itr : *vUser) {
     const string  userName(itr.key_start(), itr.key_end() - itr.key_start());
     const int32_t userId   = itr.int32();
     if (userId > lastMaxUserId_) {
       lastMaxUserId_ = userId;
     }
+	//插入数据
     nameIds_.insert(std::make_pair(userName, userId));
   }
   pthread_rwlock_unlock(&rwlock_);
@@ -512,6 +541,7 @@ int32_t UserInfo::incrementalUpdateUsers() {
 /////////////////// End of user defined coinbase disabled ///////////////////
 #endif
 
+//每隔10秒 更新用户
 void UserInfo::runThreadUpdate() {
   const time_t updateInterval = 10;  // seconds
   time_t lastUpdateTime = time(nullptr);
@@ -583,7 +613,7 @@ void UserInfo::runThreadInsertWorkerName() {
     sleep(1);
   }
 }
-
+//从workerNameQ_取一个工人名 向kafka 插入 , 然后 弹出workerNameQ_ 
 int32_t UserInfo::insertWorkerName() {
   std::deque<WorkerName>::iterator itr = workerNameQ_.end();
   {
@@ -645,18 +675,22 @@ void StratumJobEx::makeMiningNotifyStr() {
   string merkleBranchStr;
   {
     // '"'+ 64 + '"' + ',' = 67 bytes
+	  //分配 字符串空间
     merkleBranchStr.reserve(sjob_->merkleBranch_.size() * 67);
     for (size_t i = 0; i < sjob_->merkleBranch_.size(); i++) {
       //
       // do NOT use GetHex() or uint256.ToString(), need to dump the memory
       //
       string merklStr;
+	  //2进制转16进制  Bin2Hex
       Bin2Hex(sjob_->merkleBranch_[i].begin(), 32, merklStr);
       merkleBranchStr.append("\"" + merklStr + "\",");
     }
     if (merkleBranchStr.length()) {
       merkleBranchStr.resize(merkleBranchStr.length() - 1);  // remove last ','
     }
+	//从 StratumJob 中取 merkle 分叉树 转换为 字符串
+	//cout << "-----StratumJobEx::makeMiningNotifyStr   merkleBranchStr  ------" << merkleBranchStr << endl;
   }
 
   // we don't put jobId here, session will fill with the shortJobId
@@ -698,6 +732,7 @@ bool StratumJobEx::isStale() {
   return (state_ == 1);
 }
 
+//生成交易
 void StratumJobEx::generateCoinbaseTx(std::vector<char> *coinbaseBin,
                                       const uint32_t extraNonce1,
                                       const string &extraNonce2Hex,
@@ -715,12 +750,14 @@ void StratumJobEx::generateCoinbaseTx(std::vector<char> *coinbaseBin,
   }
 #endif
 
+  //组合字符串 ，并转换为2进制
   coinbaseHex.append(coinbase1);
   coinbaseHex.append(extraNonceStr);
   coinbaseHex.append(sjob_->coinbase2_);
   Hex2Bin((const char *)coinbaseHex.c_str(), *coinbaseBin);
 }
 
+//创建块头
 void StratumJobEx::generateBlockHeader(CBlockHeader *header,
                                        std::vector<char> *coinbaseBin,
                                        const uint32_t extraNonce1,
@@ -810,9 +847,12 @@ isDevModeEnable_(false), minerDifficulty_(1.0),
 kShareAvgSeconds_(shareAvgSeconds),
 jobRepository_(nullptr), userInfo_(nullptr)
 {
+	//构造   属性初始化
+	//cout <<"--------Server()----------" << endl;
 }
 
 Server::~Server() {
+	//析构 释放属性
   if (signal_event_ != nullptr) {
     event_free(signal_event_);
   }
@@ -857,22 +897,27 @@ bool Server::setup(const char *ip, const unsigned short port,
                    const uint8_t serverId, const string &fileLastNotifyTime,
                    bool isEnableSimulator, bool isSubmitInvalidBlock,
                    bool isDevModeEnable, float minerDifficulty) {
+	//设置server
+	//cout<<"-------Server::setup---------"<<endl;
+	//是否允模拟
   if (isEnableSimulator) {
     isEnableSimulator_ = true;
     LOG(WARNING) << "Simulator is enabled, all share will be accepted";
   }
 
+  //是否isSubmitInvalidBlock
   if (isSubmitInvalidBlock) {
     isSubmitInvalidBlock_ = true;
     LOG(WARNING) << "submit invalid block is enabled, all block will be submited";
   }
-
+  //设备模式?
   if (isDevModeEnable) {
     isDevModeEnable_ = true;
     minerDifficulty_ = minerDifficulty;
     LOG(INFO) << "development mode is enabled with difficulty: " << minerDifficulty;
   }
 
+  //kafka相关
   kafkaProducerSolvedShare_ = new KafkaProducer(kafkaBrokers,
                                                 KAFKA_TOPIC_SOLVED_SHARE,
                                                 RD_KAFKA_PARTITION_UA);
@@ -988,6 +1033,7 @@ bool Server::setup(const char *ip, const unsigned short port,
     }
   }
 
+  //设置消息缓存区
   base_ = event_base_new();
   if(!base_) {
     LOG(ERROR) << "server: cannot create base";
@@ -1015,6 +1061,7 @@ bool Server::setup(const char *ip, const unsigned short port,
   return true;
 }
 
+//启动server ,开启消息循环
 void Server::run() {
   if(base_ != NULL) {
     //    event_base_loop(base_, EVLOOP_NONBLOCK);
@@ -1022,6 +1069,7 @@ void Server::run() {
   }
 }
 
+//停止server，停止消息循环
 void Server::stop() {
   LOG(INFO) << "stop tcp server event loop";
   event_base_loopexit(base_, NULL);
@@ -1031,7 +1079,8 @@ void Server::stop() {
 }
 
 void Server::sendMiningNotifyToAll(shared_ptr<StratumJobEx> exJobPtr) {
-  //
+  //给所有人发送挖矿通知
+
   // http://www.sgi.com/tech/stl/Map.html
   //
   // Map has the important property that inserting a new element into a map
@@ -1043,6 +1092,8 @@ void Server::sendMiningNotifyToAll(shared_ptr<StratumJobEx> exJobPtr) {
 
   ScopeLock sl(connsLock_);
   std::map<evutil_socket_t, StratumSession *>::iterator itr = connections_.begin();
+  
+  //遍历 connections
   while (itr != connections_.end()) {
     StratumSession *conn = itr->second;  // alias
 
@@ -1080,6 +1131,7 @@ void Server::removeConnection(evutil_socket_t fd) {
   itr->second->markAsDead();
 }
 
+//设置监听回调
 void Server::listenerCallback(struct evconnlistener* listener,
                               evutil_socket_t fd,
                               struct sockaddr *saddr,
@@ -1148,27 +1200,37 @@ void Server::eventCallback(struct bufferevent* bev, short events,
   server->removeConnection(conn->fd_);
 }
 
+//检查share
 int Server::checkShare(const Share &share,
                        const uint32 extraNonce1, const string &extraNonce2Hex,
                        const uint32_t nTime, const uint32_t nonce,
                        const uint256 &jobTarget, const string &workFullName,
                        string *userCoinbaseInfo) {
   shared_ptr<StratumJobEx> exJobPtr = jobRepository_->getStratumJobEx(share.jobId_);
+
+  //cout << "---checkShare--- exjobPtr="<<&exjobPtr << endl;
+
   if (exJobPtr == nullptr) {
+	  cout << "---checkShare---  exJobPtr   JOB_NOT_FOUND"<<endl;
     return StratumError::JOB_NOT_FOUND;
   }
   StratumJob *sjob = exJobPtr->sjob_;
 
+  //cout << "---checkShare--- exjobPtr isStale=" << exjobPtr->isStale() << endl;
   if (exJobPtr->isStale()) {
+	  cout << "---checkShare---  exJobPtr->isStale()   JOB_NOT_FOUND" << endl;
     return StratumError::JOB_NOT_FOUND;
   }
   if (nTime <= sjob->minTime_) {
+	  cout << "---checkShare---  sjob->minTime_   TIME_TOO_OLD" << endl;
     return StratumError::TIME_TOO_OLD;
   }
   if (nTime > sjob->nTime_ + 600) {
+	  cout << "---checkShare---  sjob->minTime_   TIME_TOO_NEW" << endl;
     return StratumError::TIME_TOO_NEW;
   }
 
+  //新块头
   CBlockHeader header;
   std::vector<char> coinbaseBin;
   exJobPtr->generateBlockHeader(&header, &coinbaseBin,
@@ -1187,7 +1249,11 @@ int Server::checkShare(const Share &share,
   if (isSubmitInvalidBlock_ == true || bnBlockHash <= bnNetworkTarget) {
     //
     // build found block
-    //
+
+
+    //创建块
+	  cout << "---FoundBlock----" << endl;
+
     FoundBlock foundBlock;
     foundBlock.jobId_    = share.jobId_;
     foundBlock.workerId_ = share.workerHashId_;
